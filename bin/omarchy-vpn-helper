@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""JSON IPC entry point for the GlobalConnect panel."""
+
+import json
+import sys
+
+
+def main(argv: list[str]) -> int:
+    match argv:
+        case ["list"]:
+            result = {"ok": True, "profiles": []}
+        case ["status"]:
+            result = {"ok": True, "state": "DISCONNECTED", "profile_id": None}
+        case ["connect", profile_id] if profile_id:
+            result = {"ok": False, "error": {
+                "code": "NOT_IMPLEMENTED", "message": "VPN backend is not configured yet."
+            }}
+        case ["disconnect"]:
+            result = {"ok": False, "error": {
+                "code": "NOT_IMPLEMENTED", "message": "VPN backend is not configured yet."
+            }}
+        case _:
+            result = {"ok": False, "error": {
+                "code": "INVALID_REQUEST", "message": "Unknown command or invalid arguments."
+            }}
+
+    print(json.dumps(result, separators=(",", ":")))
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
