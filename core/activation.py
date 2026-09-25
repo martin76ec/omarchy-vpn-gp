@@ -63,6 +63,23 @@ def _fifo_path():
     return state_store.state_dir() / "credentials.fifo"
 
 
+def _process_start_time(pid: int) -> str | None:
+    """Field 22 (starttime, ticks since boot) of /proc/<pid>/stat — unique to
+    one OS process instance, unlike the pid itself, which the kernel freely
+    recycles once the process exits. This is what actually proves a pid
+    still names the same process that wrote the "watcher" record, not just
+    some later, unrelated process the kernel happened to hand that same
+    number. Skips past "(comm)" with rsplit(")"), since that field can
+    itself contain spaces or parens."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            stat = handle.read()
+    except OSError:
+        return None
+    fields = stat.rsplit(b")", 1)[-1].split()
+    return fields[19].decode() if len(fields) > 19 else None
+
+
 def _watcher_pid() -> int | None:
     info = state_store.read("watcher")
     if not info:
@@ -71,9 +88,26 @@ def _watcher_pid() -> int | None:
         cmdline = open(f"/proc/{info['pid']}/cmdline", "rb").read()
     except OSError:
         return None
-    # Guards against a recycled PID: only trust it if it is still a watcher
-    # (either --watch or --verify-watch — both end in "-watch").
-    return info["pid"] if b"-watch" in cmdline else None
+    # Exact argv-token match, not a substring: the old `b"-watch" in
+    # cmdline` also matched any unrelated process with, say,
+    # "--enable-file-watch" or "my-watcher.py" anywhere in its command
+    # line — confirmed: a real process passes this trivially.
+    argv = cmdline.split(b"\x00")
+    if b"--watch" not in argv and b"--verify-watch" not in argv:
+        return None
+    # Exact argv is still not enough on its own: the kernel recycles pids,
+    # cancel() below sends this one a real SIGTERM, and the "watcher"
+    # record has no expiry — if the actual watcher ever dies without
+    # reaching its own `finally` (SIGKILL, an OOM kill, a hard crash) the
+    # stale record survives indefinitely. If an unrelated process later
+    # reuses that exact pid and happens to be invoked with a "--watch"
+    # argument of its own (this project's own manual debugging runs
+    # `omarchy-vpn-helper --watch <uuid>` directly, which is exactly such
+    # an argv), the old code would signal it. Only a start-time match
+    # proves it is the SAME process instance that wrote the record.
+    if _process_start_time(info["pid"]) != info.get("start_time"):
+        return None
+    return info["pid"]
 
 
 def observe(status: Status) -> Status:
@@ -131,7 +165,8 @@ def watch(driver, profile_id: str) -> None:
         state_store.clear("failure")
         state_store.clear("verified")
         state_store.clear("prompt")
-        state_store.write("watcher", {"pid": os.getpid(), "profile_id": profile.id, "profile_name": profile.name})
+        state_store.write("watcher", {"pid": os.getpid(), "start_time": _process_start_time(os.getpid()),
+                                       "profile_id": profile.id, "profile_name": profile.name})
         if profile.engine == "openconnect":
             # A saved username/password (see verify() below) skips the
             # interactive prompt entirely: only what wasn't already known —
@@ -180,7 +215,8 @@ def verify(driver, profile_id: str) -> None:
         state_store.clear("failure")
         state_store.clear("verified")
         state_store.clear("prompt")
-        state_store.write("watcher", {"pid": os.getpid(), "profile_id": profile.id, "profile_name": profile.name, "kind": "verify"})
+        state_store.write("watcher", {"pid": os.getpid(), "start_time": _process_start_time(os.getpid()),
+                                       "profile_id": profile.id, "profile_name": profile.name, "kind": "verify"})
         captured: dict[str, str] = {}
         _authenticate(profile, capture=captured)
         if "username" not in captured or "password" not in captured:

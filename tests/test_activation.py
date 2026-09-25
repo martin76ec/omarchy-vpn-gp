@@ -5,9 +5,13 @@ call, unaffected by the two-stage OpenConnect flow covered separately in
 OpenConnectTests below.
 """
 
+import json
 import stat
+import subprocess
+import sys
 import time
 
+from core.activation import _process_start_time
 from tests.support import OVPN_UUID, WORK_UUID, FakeNmTestCase
 
 SECRET = "hunter2-S3cr3t"
@@ -81,6 +85,49 @@ class CredentialTests(FakeNmTestCase):
         time.sleep(0.6)
         result = self.helper("status")
         self.assertEqual((result["state"], result["prompt"]), ("DISCONNECTED", None))
+
+
+class WatcherPidSafetyTests(FakeNmTestCase):
+    """cancel() (wired to `disconnect`) sends a real SIGTERM to whatever
+    _watcher_pid() returns — these prove it can't be tricked into signaling
+    an unrelated process, covering both halves of the check: an exact argv
+    token (not a substring) and a start-time match (not just a recycled
+    pid). Each spawns a real decoy subprocess a naive check would have
+    trusted, points a hand-crafted "watcher" record at it, and confirms
+    `disconnect` leaves it alive."""
+
+    def spawn_decoy(self, *extra_args):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", *extra_args])
+        # addCleanup runs LIFO: registering wait() first means kill() (added
+        # second) fires first, then wait() reaps it — not the other way
+        # around, which would block for the sleep(30) on a still-alive proc.
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc
+
+    def write_watcher(self, pid, start_time):
+        self.helper("status")  # ensures state_dir() has been created (0700)
+        (self.state_dir / "watcher").write_text(
+            json.dumps({"pid": pid, "start_time": start_time, "profile_id": WORK_UUID, "profile_name": "decoy"}))
+
+    def test_argv_substring_match_is_not_enough(self):
+        # Contains "-watch" as a substring (the old, broken check) but is
+        # not the exact "--watch"/"--verify-watch" token.
+        decoy = self.spawn_decoy("--enable-file-watch")
+        self.write_watcher(decoy.pid, _process_start_time(decoy.pid))
+        self.helper("disconnect")
+        time.sleep(0.3)
+        self.assertIsNone(decoy.poll(), "an unrelated process was signaled")
+
+    def test_recycled_pid_with_stale_start_time_is_not_enough(self):
+        # Exact "--watch" token this time, but the recorded start_time does
+        # not match this process — simulating the real watcher having died
+        # and this pid since being handed to something else entirely.
+        decoy = self.spawn_decoy("--watch")
+        self.write_watcher(decoy.pid, "0")
+        self.helper("disconnect")
+        time.sleep(0.3)
+        self.assertIsNone(decoy.poll(), "a recycled pid was signaled")
 
 
 class OpenConnectTests(FakeNmTestCase):
