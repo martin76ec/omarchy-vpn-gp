@@ -3,7 +3,7 @@
   "id": "dev.martin.global-connect",
   "name": "GlobalConnect",
   "version": "0.1.0",
-  "author": "Martin",
+  "author": "martin76ec",
   "license": "MIT",
   "description": "VPN status and controls for the Omarchy bar.",
   "kinds": ["bar-widget"],
