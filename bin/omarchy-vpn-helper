@@ -1,28 +1,138 @@
 #!/usr/bin/env python3
-"""JSON IPC entry point for the GlobalConnect panel."""
+"""JSON IPC entry point for the GlobalConnect panel.
+
+Every invocation prints exactly one JSON object on stdout; the exit code is 0
+only when "ok" is true. `credentials` reads the secret and `add` a
+JSON request from stdin (one line); `--watch`/`--verify-watch` are internal
+(the detached watchers started by `connect`/`verify`).
+"""
 
 import json
+import subprocess
 import sys
+from dataclasses import asdict
+from pathlib import Path
+
+# The shell watches this directory and reloads the plugin on any change, so
+# the helper must not drop __pycache__ next to its sources.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core import activation, profile_store, secret_store, state_store  # noqa: E402
+from core.drivers.nm_driver import NetworkManagerDriver  # noqa: E402
+from core.errors import VpnError  # noqa: E402
+from core.fsm import ConnectionFSM, State  # noqa: E402
+from core.security import scrub, validate_profile_id  # noqa: E402
+
+# Failures inside this window (polkit denial, unknown profile) are returned
+# from `connect`/`verify` themselves; later ones surface via `status`.
+EARLY_FAILURE_WINDOW = 1.0
 
 
-def main(argv: list[str]) -> int:
+def _spawn_detached(watch_flag: str, profile_id: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), watch_flag, profile_id],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def spawn_watcher(profile_id: str) -> None:
+    watcher = _spawn_detached("--watch", profile_id)
+    try:
+        code = watcher.wait(timeout=EARLY_FAILURE_WINDOW)
+    except subprocess.TimeoutExpired:
+        return
+    if not code:
+        return
+    failure = state_store.read("failure") or {"code": "NM_ERROR", "message": "The VPN connection failed to start."}
+    state_store.clear("failure")
+    raise VpnError(failure["code"], failure["message"])
+
+
+def spawn_verify_watcher(profile_id: str) -> None:
+    watcher = _spawn_detached("--verify-watch", profile_id)
+    try:
+        code = watcher.wait(timeout=EARLY_FAILURE_WINDOW)
+    except subprocess.TimeoutExpired:
+        return
+    if not code:
+        return
+    verified = state_store.read("verified") or {"code": "NM_ERROR", "message": "Verification failed to start."}
+    state_store.clear("verified")
+    raise VpnError(verified["code"], verified["message"])
+
+
+def dispatch(argv: list[str], driver: NetworkManagerDriver) -> dict:
     match argv:
         case ["list"]:
-            result = {"ok": True, "profiles": []}
+            profiles = [{**asdict(p), "has_saved_credentials": secret_store.has_saved(p.id)} for p in driver.profiles()]
+            return {"ok": True, "profiles": profiles}
         case ["status"]:
-            result = {"ok": True, "state": "DISCONNECTED", "profile_id": None}
-        case ["connect", profile_id] if profile_id:
-            result = {"ok": False, "error": {
-                "code": "NOT_IMPLEMENTED", "message": "VPN backend is not configured yet."
-            }}
+            status = activation.observe(driver.status())
+            return {"ok": True, "state": status.state, "profile_id": status.profile_id,
+                    "profile_name": status.profile_name, "error": status.error, "prompt": status.prompt,
+                    "verifying": status.verifying, "verified": status.verified}
+        case ["test-server", raw_id]:
+            latency = driver.test_server(validate_profile_id(raw_id))
+            return {"ok": True, "reachable": latency is not None, "latency_ms": latency}
+        case ["telemetry"]:
+            status = driver.status()
+            if status.state is not State.CONNECTED:
+                raise VpnError("INVALID_STATE", "No VPN connection is established.")
+            return {"ok": True, **asdict(driver.telemetry(status.profile_id))}
+        case ["connect", raw_id]:
+            profile_id = validate_profile_id(raw_id)
+            ConnectionFSM(activation.observe(driver.status()).state).transition(
+                State.CONNECTING, "A VPN connection is already active or in progress.")
+            spawn_watcher(profile_id)
+            return {"ok": True, "state": State.CONNECTING, "profile_id": profile_id}
         case ["disconnect"]:
-            result = {"ok": False, "error": {
-                "code": "NOT_IMPLEMENTED", "message": "VPN backend is not configured yet."
-            }}
+            active = driver.status()
+            observed = activation.observe(active)
+            ConnectionFSM(observed.state).transition(State.DISCONNECTING, "No VPN connection is active.")
+            activation.cancel()
+            if active.profile_id:
+                driver.disconnect(active.profile_id)
+            return {"ok": True, "state": State.DISCONNECTING, "profile_id": observed.profile_id}
+        case ["credentials", prompt_id]:
+            activation.submit(prompt_id, sys.stdin.readline().rstrip("\n"))
+            return {"ok": True}
+        case ["add"]:
+            try:
+                request = json.loads(sys.stdin.readline())
+            except json.JSONDecodeError:
+                raise VpnError("INVALID_REQUEST", "Expected one line of JSON on stdin.") from None
+            return {"ok": True, "profile_id": profile_store.add(driver, request)}
+        case ["delete", raw_id]:
+            profile_id = validate_profile_id(raw_id)
+            driver.delete(profile_id)
+            secret_store.clear(profile_id)
+            return {"ok": True}
+        case ["verify", raw_id]:
+            profile_id = validate_profile_id(raw_id)
+            ConnectionFSM(activation.observe(driver.status()).state).transition(
+                State.CONNECTING, "A VPN connection is already active or in progress.")
+            spawn_verify_watcher(profile_id)
+            return {"ok": True, "state": State.CONNECTING, "profile_id": profile_id}
+        case ["--watch", raw_id]:
+            profile_id = validate_profile_id(raw_id)
+            activation.watch(driver, profile_id)
+            return {"ok": True, "state": State.CONNECTED, "profile_id": profile_id}
+        case ["--verify-watch", raw_id]:
+            profile_id = validate_profile_id(raw_id)
+            activation.verify(driver, profile_id)
+            return {"ok": True, "profile_id": profile_id}
         case _:
-            result = {"ok": False, "error": {
-                "code": "INVALID_REQUEST", "message": "Unknown command or invalid arguments."
-            }}
+            raise VpnError("INVALID_REQUEST", "Unknown command or invalid arguments.")
+
+
+def main(argv: list[str], driver: NetworkManagerDriver | None = None) -> int:
+    try:
+        result = dispatch(argv, driver or NetworkManagerDriver())
+    except VpnError as err:
+        result = {"ok": False, "error": {"code": err.code, "message": str(err)}}
+    except Exception as err:  # noqa: BLE001 - the contract guarantees one JSON object
+        result = {"ok": False, "error": {"code": "INTERNAL_ERROR", "message": scrub(f"{type(err).__name__}: {err}")}}
 
     print(json.dumps(result, separators=(",", ":")))
     return 0 if result["ok"] else 1

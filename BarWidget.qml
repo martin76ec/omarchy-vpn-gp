@@ -43,8 +43,9 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "VPN"
-    tooltipText: "Open GlobalConnect"
+    text: panelLoader.item ? panelLoader.item.barLabel : "󰖂"
+    active: panelLoader.item ? panelLoader.item.vpnActive === true : false
+    tooltipText: panelLoader.item ? panelLoader.item.tooltip : "Open GlobalConnect"
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
     }

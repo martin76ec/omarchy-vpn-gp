@@ -1,11 +1,23 @@
 # GlobalConnect
 
-Omarchy bar widget scaffold for a future NetworkManager VPN client. The current panel reports that the backend is not configured; it cannot connect to a VPN yet.
+Omarchy bar widget that lists, connects and disconnects NetworkManager VPN profiles (OpenConnect: GlobalProtect/AnyConnect/Pulse, and OpenVPN). It does not create profiles or store credentials; it drives what NetworkManager already knows.
 
-## Validate
+## Setup
 
-Run `make validate` from this directory. Omarchy loads `BarWidget.qml` as a `bar-widget`; that file loads `Panel.qml` in the existing shell process.
+1. Install NetworkManager and the plugin for your protocol: `networkmanager-openconnect` and/or `networkmanager-openvpn`. GlobalProtect/AnyConnect/Pulse profiles also need `python-gobject` (provides the `gi`/libnm Python bindings the cookie handoff uses — see step 3) and the `openconnect` CLI, both usually already present alongside `networkmanager-openconnect`. The plugin never runs any of this for you (it never calls `sudo`, and neither does any first-party Omarchy plugin); if you skip a step, connecting shows the exact command to run.
+2. Create a profile with `nm-connection-editor` or `nmcli connection add type vpn ...`. Only profiles whose service type is OpenConnect or OpenVPN are listed.
+3. Credentials are requested in the panel itself. GlobalProtect/AnyConnect/Pulse profiles authenticate through `openconnect --authenticate` (the officially documented way to script OpenConnect — see openconnect(8)), then the resulting cookie is handed to NetworkManager by a real, throwaway secret agent this plugin registers for that one activation (`core/nm_secrets.py`). That's not a stylistic choice: confirmed against a real GlobalProtect portal that NetworkManager rejects nmcli's `--ask` agent for *every* secret this VPN service asks for — not just the interactive username/password round — and that pre-caching the secret on the connection doesn't help either, since this service always asks fresh. Only a real secret agent answering the live request works. OpenVPN profiles use `nmcli --ask` directly — that one nmcli can actually serve, no extra agent needed.
 
-## Planned runtime dependencies
+## Usage
 
-The VPN implementation will require NetworkManager, the relevant `networkmanager-openconnect` or `networkmanager-openvpn` plugin, and a working user-session secret agent. Network changes are authorized through NetworkManager and polkit. The plugin will not invoke `sudo`.
+Click the bar button. While connected the panel shows throughput and gateway latency (TCP connect time; OpenConnect profiles only). `j`/`k` move, `Enter` connects the selected profile (or disconnects it when active), `t` toggles, `r` refreshes, `Esc` closes. Only one VPN can be active at a time.
+
+## Privilege boundary
+
+The panel and `bin/omarchy-vpn-helper` run as your user and never call `sudo`. NetworkManager performs the network changes under its polkit policy; if polkit denies the request the panel shows the error and stops. Credentials you type go panel stdin, then the helper's stdin, then a 0600 FIFO in `$XDG_RUNTIME_DIR/omarchy-global-connect` (0700, tmpfs), then the running subprocess's stdin. They are never placed in an argument list, written to a file, or logged. The GlobalProtect/AnyConnect/Pulse cookie that comes out the other end is a different kind of secret — not something you typed, but still sensitive — and is handed to NetworkManager entirely in-process: this plugin registers a real NetworkManager secret agent for the duration of one activation, which answers the daemon's live request over its own D-Bus callback, never a subprocess argument, a file, or a log. Failures and prompts are kept in the runtime directory and disappear on logout. The helper only activates connections that are OpenConnect/OpenVPN profiles, so a crafted profile ID cannot bring down Wi-Fi or Ethernet.
+
+## Development
+
+- `make check` runs plugin validation, the tests and a bytecode compile. `make test` runs only the tests (`tests/fake_nmcli.py` stands in for `nmcli`, so no VPN is needed).
+- QML lint: `qmllint -I <dir containing a "qs" symlink to /usr/share/omarchy/shell> BarWidget.qml Panel.qml`.
+- The OpenConnect two-stage flow (authenticate, then register a real secret agent for one activation, answering with `gateway`, `cookie` and `gwcert` together, each declared agent-owned via a `-flags = 2` entry in `vpn.data`) is verified against fakes for the automated tests, and mechanically end-to-end against the real GlobalProtect portal and a real (disposable) connection profile: a deliberately-fake but complete three-secret answer, with the flags declared, was accepted as sufficient by both NetworkManager and the VPN service — confirmed via NetworkManager's own debug-level log, not assumed — and activation proceeded all the way to a real round trip with the real server, which correctly responded "login failed" for the fake cookie. **`core/nm_secrets.py`'s module docstring has the full debugging history** — three real, separate bugs, two disproven designs, and a testing-methodology trap (a connection used for mechanical testing gets its secret cache poisoned by NetworkManager and must be deleted and recreated before real use) — worth reading before touching this code again. A full tunnel with a real login has not yet been confirmed — the one remaining step. OpenVPN's single-stage `nmcli --ask` relay is verified with the fake `nmcli` only, not a real OpenVPN profile. Portals that redirect to a browser for SAML/SSO login are not handled (USFQ's portal, checked directly, is plain username/password, not SAML).
