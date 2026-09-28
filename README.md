@@ -2,6 +2,8 @@
 
 Omarchy bar widget that lists, connects and disconnects NetworkManager VPN profiles (OpenConnect: GlobalProtect/AnyConnect/Pulse, and OpenVPN). It does not create profiles; it drives what NetworkManager already knows. Credentials are only ever stored if you explicitly ask it to (see **Saved credentials** below) — by default it asks each time, the same as NetworkManager itself would.
 
+![The GlobalConnect panel showing a disconnected profile with saved credentials](preview.png)
+
 ## Setup
 
 1. Install NetworkManager and the plugin for your protocol: `networkmanager-openconnect` and/or `networkmanager-openvpn`. GlobalProtect/AnyConnect/Pulse profiles also need `python-gobject` (provides the `gi`/libnm Python bindings the cookie handoff uses — see step 3) and the `openconnect` CLI, both usually already present alongside `networkmanager-openconnect`. The plugin never runs any of this for you (it never calls `sudo`, and neither does any first-party Omarchy plugin); if you skip a step, connecting shows the exact command to run.
